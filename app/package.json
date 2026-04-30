@@ -1,0 +1,19 @@
+{
+  "name": "pethq",
+  "version": "2.0.0",
+  "description": "PetHQ — AI-powered pet care platform with MCP orchestration pattern",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.0",
+    "pg": "^8.13.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "Head in the Clouds — ISQA 8330",
+  "license": "MIT"
+}

@@ -1,0 +1,384 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  PetHQ Portfolio Stack — Single-template deployment for always-on portfolio hosting.
+  Creates: VPC, public + private subnets, 1x EC2 (Node.js + Ollama), 1x RDS PostgreSQL.
+  No ALB, no NAT Gateway, no Dify — minimal cost, full MCP demo.
+  
+  Original enterprise version used 3 EC2s, ALB, NAT Gateway, Dify, Cognito, DynamoDB.
+  See aws-original/ folder for the full multi-stack architecture.
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+Parameters:
+
+  DBPassword:
+    Type: String
+    Default: pethqadmin
+    NoEcho: true
+    Description: RDS PostgreSQL master password.
+
+  AmazonLinux2023AMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+    Description: >
+      EC2 instance type. t3.small (2 GiB RAM) is the minimum recommended
+      for running Ollama + tinyllama + Node.js together. t3.micro works
+      with 4GB swap but responses will be slower.
+
+  KeyPairName:
+    Type: String
+    Default: ''
+    Description: >
+      Optional EC2 key pair for SSH access. Leave blank to use Session Manager only.
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+
+# ============================================================
+# RESOURCES
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # NETWORKING — VPC with public + private subnets
+  # ----------------------------------------------------------
+
+  PetHQVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: pethq-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: pethq-igw
+
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref PetHQVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public subnet — EC2 lives here (direct internet access via IGW)
+  PublicSubnetAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PetHQVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: pethq-public-AZ1
+
+  PublicSubnetAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PetHQVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: pethq-public-AZ2
+
+  # Private subnets for RDS (required: RDS needs 2 AZs)
+  PrivateDBSubnetAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PetHQVPC
+      CidrBlock: 10.0.200.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: pethq-private-db-AZ1
+
+  PrivateDBSubnetAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PetHQVPC
+      CidrBlock: 10.0.201.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: pethq-private-db-AZ2
+
+  # Route tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PetHQVPC
+      Tags:
+        - Key: Name
+          Value: pethq-rt-public
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIGW
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetAZ1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetAZ1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetAZ2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetAZ2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ----------------------------------------------------------
+  # SECURITY GROUPS
+  # ----------------------------------------------------------
+
+  # EC2 SG — HTTP (80) + SSH (22, optional) from internet
+  SGApp:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: pethq-sg-app
+      GroupDescription: Public HTTP access to PetHQ app
+      VpcId: !Ref PetHQVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: pethq-sg-app
+
+  # RDS SG — PostgreSQL from EC2 only
+  SGRds:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: pethq-sg-rds
+      GroupDescription: App EC2 to RDS PostgreSQL on port 5432
+      VpcId: !Ref PetHQVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref SGApp
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: pethq-sg-rds
+
+  # ----------------------------------------------------------
+  # EC2 INSTANCE — Node.js + Ollama on one box
+  # ----------------------------------------------------------
+
+  AppElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: pethq-eip
+
+  AppEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref AppEC2
+      AllocationId: !GetAtt AppElasticIP.AllocationId
+
+  AppEC2:
+    Type: AWS::EC2::Instance
+    DependsOn: RDSInstance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmazonLinux2023AMI
+      SubnetId: !Ref PublicSubnetAZ1
+      SecurityGroupIds:
+        - !Ref SGApp
+      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+
+          # --- System packages ---
+          yum install -y nodejs npm nginx postgresql15
+
+          # --- Install Ollama and bind to localhost ---
+          curl -fsSL https://ollama.ai/install.sh | sh
+          mkdir -p /etc/systemd/system/ollama.service.d
+          cat > /etc/systemd/system/ollama.service.d/override.conf << 'EOF'
+          [Service]
+          Environment="OLLAMA_HOST=127.0.0.1:11434"
+          EOF
+          systemctl daemon-reload
+          systemctl enable ollama
+          systemctl start ollama
+
+          # --- Pull tinyllama model ---
+          sleep 10
+          ollama pull tinyllama
+
+          # --- Add swap (persists via fstab) ---
+          dd if=/dev/zero of=/swapfile bs=1M count=4096
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+          echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
+
+          # --- Create app directory ---
+          mkdir -p /opt/pethq
+          chown ec2-user:ec2-user /opt/pethq
+
+          # --- nginx reverse proxy ---
+          cat > /etc/nginx/conf.d/pethq.conf << 'NGINX'
+          server {
+              listen 80;
+              proxy_read_timeout 180s;
+              proxy_connect_timeout 10s;
+              proxy_send_timeout 180s;
+
+              location / {
+                  proxy_pass http://localhost:3001;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+              }
+          }
+          NGINX
+          # Remove default nginx config
+          rm -f /etc/nginx/conf.d/default.conf
+          systemctl enable nginx
+          systemctl start nginx
+
+          # --- Create .env file ---
+          cat > /opt/pethq/.env << ENVFILE
+          DB_HOST=${RDSInstance.Endpoint.Address}
+          DB_PORT=5432
+          DB_NAME=pethq
+          DB_USER=postgres
+          DB_PASSWORD=${DBPassword}
+          OLLAMA_HOST=http://localhost:11434
+          ENVFILE
+          chown ec2-user:ec2-user /opt/pethq/.env
+
+          # --- Create systemd service for PetHQ app ---
+          cat > /etc/systemd/system/pethq.service << 'SVC'
+          [Unit]
+          Description=PetHQ Node.js App
+          After=network.target ollama.service
+
+          [Service]
+          Type=simple
+          User=ec2-user
+          WorkingDirectory=/opt/pethq
+          ExecStart=/usr/bin/node /opt/pethq/server.js
+          Restart=always
+          RestartSec=5
+          Environment=NODE_ENV=production
+
+          [Install]
+          WantedBy=multi-user.target
+          SVC
+          systemctl daemon-reload
+          systemctl enable pethq
+
+          # NOTE: Deploy app files to /opt/pethq/ then run:
+          #   cd /opt/pethq && npm install pg dotenv
+          #   sudo systemctl start pethq
+      Tags:
+        - Key: Name
+          Value: pethq-app
+
+  # ----------------------------------------------------------
+  # RDS PostgreSQL
+  # ----------------------------------------------------------
+
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: pethq-db-subnet-group
+      DBSubnetGroupDescription: PetHQ DB subnets
+      SubnetIds:
+        - !Ref PrivateDBSubnetAZ1
+        - !Ref PrivateDBSubnetAZ2
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: pethq-db
+      DBInstanceClass: db.t3.micro
+      Engine: postgres
+      EngineVersion: '15'
+      MasterUsername: postgres
+      MasterUserPassword: !Ref DBPassword
+      DBName: pethq
+      AllocatedStorage: 20
+      StorageType: gp2
+      PubliclyAccessible: false
+      VPCSecurityGroups:
+        - !Ref SGRds
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      MultiAZ: false
+      DeletionProtection: false
+      BackupRetentionPeriod: 1
+    DeletionPolicy: Snapshot
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+Outputs:
+
+  AppPublicIP:
+    Description: Public IP — access PetHQ at http://<this-ip>
+    Value: !Ref AppElasticIP
+
+  AppEC2Id:
+    Description: EC2 Instance ID
+    Value: !Ref AppEC2
+
+  RDSEndpoint:
+    Description: RDS PostgreSQL endpoint
+    Value: !GetAtt RDSInstance.Endpoint.Address
+
+  SSHCommand:
+    Description: SSH command (if key pair was provided)
+    Value: !Sub 'ssh -i ${KeyPairName}.pem ec2-user@${AppElasticIP}'
+
+  DeployInstructions:
+    Description: After stack creation — deploy app files
+    Value: >
+      1) SCP or git clone app files to /opt/pethq/ on the EC2.
+      2) cd /opt/pethq && npm install pg dotenv
+      3) Run schema: psql -h <RDS-endpoint> -U postgres -d pethq -f db/schema.sql
+      4) sudo systemctl start pethq
+      5) Access at http://<AppPublicIP>

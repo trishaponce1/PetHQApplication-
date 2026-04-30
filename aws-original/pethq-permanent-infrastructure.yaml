@@ -1,0 +1,616 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  PetHQ Permanent Infrastructure Stack - Deploy ONCE per Learner Lab account.
+  Creates VPC, subnets, route tables, security groups, EC2 instances, S3, DynamoDB, and RDS.
+  Group 1 - Head in the Clouds | ISQA 8330 | Sprint 3
+
+# ============================================================
+# PARAMETERS — Fill these in before deploying
+# ============================================================
+Parameters:
+
+  S3BucketName:
+    Type: String
+    Default: pethq-s3-team1tp
+    Description: >
+      S3 bucket name for app files (server.js, context.js, tools.js).
+      Must be globally unique - add your initials if needed (e.g. pethq-s3-iw).
+
+  DBPassword:
+    Type: String
+    Default: pethqadmin
+    NoEcho: true
+    Description: RDS PostgreSQL master password. Default is pethqadmin.
+
+  AmazonLinux2023AMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: >
+      Latest Amazon Linux 2023 AMI - auto-resolved via SSM. No need to change this.
+
+# ============================================================
+# RESOURCES
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # PHASE 1 — VPC & NETWORKING
+  # ----------------------------------------------------------
+
+  PetHQVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: pethq-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: pethq-igw
+
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref PetHQVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # --- 6 Subnets ---
+
+  PublicSubnetAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PetHQVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: us-east-1a
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: public-AZ1
+
+  PublicSubnetAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PetHQVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: us-east-1b
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: public-AZ2
+
+  PrivateAppSubnetAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PetHQVPC
+      CidrBlock: 10.0.130.0/24
+      AvailabilityZone: us-east-1a
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: private-app-AZ1
+
+  PrivateAppSubnetAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PetHQVPC
+      CidrBlock: 10.0.131.0/24
+      AvailabilityZone: us-east-1b
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: private-app-AZ2
+
+  PrivateDBSubnetAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PetHQVPC
+      CidrBlock: 10.0.200.0/24
+      AvailabilityZone: us-east-1a
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: private-db-AZ1
+
+  PrivateDBSubnetAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PetHQVPC
+      CidrBlock: 10.0.201.0/24
+      AvailabilityZone: us-east-1b
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: private-db-AZ2
+
+  # --- Route Tables ---
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PetHQVPC
+      Tags:
+        - Key: Name
+          Value: pethq-rt-public
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIGW
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetAZ1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetAZ1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetAZ2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetAZ2
+      RouteTableId: !Ref PublicRouteTable
+
+  # Private route table — NO 0.0.0.0/0 yet (NAT is added each session via per-session stack)
+  PrivateAppRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PetHQVPC
+      Tags:
+        - Key: Name
+          Value: pethq-rt-private
+
+  PrivateAppSubnetAZ1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetAZ1
+      RouteTableId: !Ref PrivateAppRouteTable
+
+  PrivateAppSubnetAZ2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetAZ2
+      RouteTableId: !Ref PrivateAppRouteTable
+
+  # DB route table — fully isolated, no internet route ever
+  DBRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PetHQVPC
+      Tags:
+        - Key: Name
+          Value: pethq-rt-db
+
+  DBSubnetAZ1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDBSubnetAZ1
+      RouteTableId: !Ref DBRouteTable
+
+  DBSubnetAZ2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDBSubnetAZ2
+      RouteTableId: !Ref DBRouteTable
+
+  # ----------------------------------------------------------
+  # PHASE 2 — SECURITY GROUPS
+  # ----------------------------------------------------------
+
+  # ALB SG — accepts public HTTP traffic
+  SGAlb:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: pethq-sg-alb
+      GroupDescription: Public internet traffic to ALB on port 80
+      VpcId: !Ref PetHQVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: pethq-sg-alb
+
+  # App SG — only accepts traffic from ALB on port 3000
+  SGApp:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: pethq-sg-app
+      GroupDescription: ALB to App EC2 on port 3000 only
+      VpcId: !Ref PetHQVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref SGAlb
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: pethq-sg-app
+
+  # Ollama SG — TWO inbound rules: port 11434 (Ollama API) AND port 80 (Dify UI)
+  # WARNING: Missing port 80 causes 504 errors on /signin
+  SGOllama:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: pethq-sg-ollama
+      GroupDescription: App to Ollama - port 11434 (API) and port 80 (Dify UI)
+      VpcId: !Ref PetHQVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 11434
+          ToPort: 11434
+          SourceSecurityGroupId: !Ref SGApp
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref SGApp
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: pethq-sg-ollama
+
+  # RDS SG — only accepts PostgreSQL from App EC2
+  SGRds:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: pethq-sg-rds
+      GroupDescription: App EC2 to RDS PostgreSQL on port 5432
+      VpcId: !Ref PetHQVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref SGApp
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: pethq-sg-rds
+
+  # ----------------------------------------------------------
+  # PHASE 3 — EC2 INSTANCES
+  # All use LabInstanceProfile for Session Manager access.
+  # No key pairs, no public IPs.
+  # ----------------------------------------------------------
+
+  # pethq-app — t2.micro, private-app-AZ1, 8GB gp3
+  # UserData installs Node.js and nginx (one-time setup)
+  AppEC2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: !Ref AmazonLinux2023AMI
+      SubnetId: !Ref PrivateAppSubnetAZ1
+      SecurityGroupIds:
+        - !Ref SGApp
+      IamInstanceProfile: LabInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Install Node.js and nginx — one-time permanent setup
+          yum install -y nodejs npm nginx
+          systemctl enable nginx
+          # nginx config will be written once OllamaIP is known
+          # See setup manual Phase 8 to write /etc/nginx/conf.d/pethq.conf
+      Tags:
+        - Key: Name
+          Value: pethq-app
+
+  # pethq-app-2 — t2.micro, private-app-AZ2, 8GB gp3
+  AppEC22:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: !Ref AmazonLinux2023AMI
+      SubnetId: !Ref PrivateAppSubnetAZ2
+      SecurityGroupIds:
+        - !Ref SGApp
+      IamInstanceProfile: LabInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum install -y nodejs npm nginx
+          systemctl enable nginx
+      Tags:
+        - Key: Name
+          Value: pethq-app-2
+
+  # pethq-ollama — t3.large, private-app-AZ1, 30GB gp3
+  # UserData installs Docker, Docker Compose, Ollama, and pulls tinyllama
+  OllamaEC2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.large
+      ImageId: !Ref AmazonLinux2023AMI
+      SubnetId: !Ref PrivateAppSubnetAZ1
+      SecurityGroupIds:
+        - !Ref SGOllama
+      IamInstanceProfile: LabInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # --- Install Docker and Docker Compose ---
+          yum install -y docker git
+          systemctl start docker
+          systemctl enable docker
+          curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+            -o /usr/local/bin/docker-compose
+          chmod +x /usr/local/bin/docker-compose
+
+          # --- Install Ollama and configure to bind to 0.0.0.0 ---
+          curl -fsSL https://ollama.ai/install.sh | sh
+          mkdir -p /etc/systemd/system/ollama.service.d
+          cat > /etc/systemd/system/ollama.service.d/override.conf << 'EOF'
+          [Service]
+          Environment="OLLAMA_HOST=0.0.0.0:11434"
+          EOF
+          systemctl daemon-reload
+          systemctl enable ollama
+          systemctl start ollama
+
+          # --- Pull tinyllama model ---
+          # Wait for Ollama to be ready before pulling
+          sleep 10
+          ollama pull tinyllama
+
+          # --- Clone and configure Dify ---
+          sudo -u ec2-user bash -c '
+            git clone https://github.com/langgenius/dify.git ~/dify
+            cd ~/dify/docker
+            cp .env.example .env
+            sed -i "s/TEXT_GENERATION_TIMEOUT_MS=60000/TEXT_GENERATION_TIMEOUT_MS=300000/" .env
+            sed -i "s/GUNICORN_TIMEOUT=360/GUNICORN_TIMEOUT=600/" .env
+          '
+          # NOTE: docker-compose up -d is run manually each session — do not autostart here
+      Tags:
+        - Key: Name
+          Value: pethq-ollama
+
+  # ----------------------------------------------------------
+  # PHASE 4 — S3 BUCKET
+  # ----------------------------------------------------------
+
+  AppS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Ref S3BucketName
+
+  # ----------------------------------------------------------
+  # PHASE 4 — DYNAMODB TABLES
+  # ----------------------------------------------------------
+
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: sessions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: sessionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sessionId
+          KeyType: HASH
+
+  AICacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ai-cache
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: cacheKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: cacheKey
+          KeyType: HASH
+
+  PetCacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: pet-cache
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: petId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: petId
+          KeyType: HASH
+
+  # ----------------------------------------------------------
+  # PHASE 10 — RDS PostgreSQL
+  # ----------------------------------------------------------
+
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: pethq-db-subnet-group
+      DBSubnetGroupDescription: PetHQ DB subnets - AZ1 and AZ2
+      SubnetIds:
+        - !Ref PrivateDBSubnetAZ1
+        - !Ref PrivateDBSubnetAZ2
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: pethq-db
+      DBInstanceClass: db.t3.micro
+      Engine: postgres
+      MasterUsername: postgres
+      MasterUserPassword: !Ref DBPassword
+      DBName: pethq
+      AllocatedStorage: 20
+      StorageType: gp2
+      PubliclyAccessible: false
+      VPCSecurityGroups:
+        - !Ref SGRds
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      MultiAZ: false
+      DeletionProtection: false
+    DeletionPolicy: Snapshot
+
+# ============================================================
+# OUTPUTS — These replace your manual Resource Reference Sheet
+# ============================================================
+Outputs:
+
+  VPCId:
+    Description: VPC ID - use wherever pethq-vpc is referenced
+    Value: !Ref PetHQVPC
+    Export:
+      Name: PetHQ-VPCId
+
+  PublicSubnetAZ1Id:
+    Description: public-AZ1 Subnet ID
+    Value: !Ref PublicSubnetAZ1
+    Export:
+      Name: PetHQ-PublicSubnetAZ1
+
+  PublicSubnetAZ2Id:
+    Description: public-AZ2 Subnet ID
+    Value: !Ref PublicSubnetAZ2
+    Export:
+      Name: PetHQ-PublicSubnetAZ2
+
+  PrivateAppSubnetAZ1Id:
+    Description: private-app-AZ1 Subnet ID
+    Value: !Ref PrivateAppSubnetAZ1
+    Export:
+      Name: PetHQ-PrivateAppSubnetAZ1
+
+  PrivateAppSubnetAZ2Id:
+    Description: private-app-AZ2 Subnet ID
+    Value: !Ref PrivateAppSubnetAZ2
+    Export:
+      Name: PetHQ-PrivateAppSubnetAZ2
+
+  PrivateDBSubnetAZ1Id:
+    Description: private-db-AZ1 Subnet ID
+    Value: !Ref PrivateDBSubnetAZ1
+    Export:
+      Name: PetHQ-PrivateDBSubnetAZ1
+
+  PrivateDBSubnetAZ2Id:
+    Description: private-db-AZ2 Subnet ID
+    Value: !Ref PrivateDBSubnetAZ2
+    Export:
+      Name: PetHQ-PrivateDBSubnetAZ2
+
+  SGAlbId:
+    Description: pethq-sg-alb Security Group ID
+    Value: !Ref SGAlb
+    Export:
+      Name: PetHQ-SGAlb
+
+  SGAppId:
+    Description: pethq-sg-app Security Group ID
+    Value: !Ref SGApp
+    Export:
+      Name: PetHQ-SGApp
+
+  SGOllamaId:
+    Description: pethq-sg-ollama Security Group ID
+    Value: !Ref SGOllama
+    Export:
+      Name: PetHQ-SGOllama
+
+  SGRdsId:
+    Description: pethq-sg-rds Security Group ID
+    Value: !Ref SGRds
+    Export:
+      Name: PetHQ-SGRds
+
+  AppEC2PrivateIP:
+    Description: pethq-app Private IP
+    Value: !GetAtt AppEC2.PrivateIp
+    Export:
+      Name: PetHQ-AppEC2PrivateIP
+
+  AppEC22PrivateIP:
+    Description: pethq-app-2 Private IP
+    Value: !GetAtt AppEC22.PrivateIp
+    Export:
+      Name: PetHQ-AppEC22PrivateIP
+
+  OllamaPrivateIP:
+    Description: >
+      pethq-ollama Private IP - CRITICAL. Use this value as [OLLAMA-IP]
+      in nginx config and server.js throughout the setup manual.
+    Value: !GetAtt OllamaEC2.PrivateIp
+    Export:
+      Name: PetHQ-OllamaPrivateIP
+
+  AppEC2Id:
+    Description: pethq-app EC2 Instance ID
+    Value: !Ref AppEC2
+    Export:
+      Name: PetHQ-AppEC2Id
+
+  AppEC22Id:
+    Description: pethq-app-2 EC2 Instance ID
+    Value: !Ref AppEC22
+    Export:
+      Name: PetHQ-AppEC22Id
+
+  OllamaEC2Id:
+    Description: pethq-ollama EC2 Instance ID
+    Value: !Ref OllamaEC2
+    Export:
+      Name: PetHQ-OllamaEC2Id
+
+  RDSEndpoint:
+    Description: RDS PostgreSQL endpoint - use as [RDS-ENDPOINT] in server.js and context.js
+    Value: !GetAtt RDSInstance.Endpoint.Address
+    Export:
+      Name: PetHQ-RDSEndpoint
+
+  PrivateRouteTableId:
+    Description: pethq-rt-private Route Table ID - needed by per-session stack to add NAT route
+    Value: !Ref PrivateAppRouteTable
+    Export:
+      Name: PetHQ-PrivateRouteTableId
+
+  S3BucketName:
+    Description: S3 bucket for app code files
+    Value: !Ref AppS3Bucket
+    Export:
+      Name: PetHQ-S3BucketName

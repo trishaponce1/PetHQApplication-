@@ -1,0 +1,174 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  PetHQ Per-Session Stack — Deploy at the START of every working session.
+  Creates NAT Gateway, updates private route table, creates Target Group and ALB.
+  Tear this stack down at the END of every session to avoid charges.
+  Group 1 — Head in the Clouds | ISQA 8330 | Sprint 3
+
+# ============================================================
+# COST REMINDER
+# NAT Gateway:    ~$0.045/hr
+# ALB:            ~$0.0225/hr
+# Elastic IP:     ~$0.005/hr (when not attached)
+# Always delete this stack at session end!
+# ============================================================
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+Parameters:
+
+  AppEC2Id:
+    Type: String
+    Description: >
+      EC2 Instance ID of pethq-app.
+      Found in the Outputs of the permanent stack (PetHQ-AppEC2Id),
+      or in EC2 Console → Instances.
+    Default: ""
+
+  AppEC22Id:
+    Type: String
+    Description: >
+      EC2 Instance ID of pethq-app-2.
+      Found in the Outputs of the permanent stack (PetHQ-AppEC22Id),
+      or in EC2 Console → Instances.
+    Default: ""
+
+# ============================================================
+# RESOURCES
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # PHASE 5 — NAT GATEWAY (Every Session)
+  # Placed in public-AZ1. Elastic IP is allocated automatically.
+  # ----------------------------------------------------------
+
+  NATElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: pethq-nat-eip
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATElasticIP.AllocationId
+      SubnetId: !ImportValue PetHQ-PublicSubnetAZ1
+      Tags:
+        - Key: Name
+          Value: pethq-nat
+
+  # Add 0.0.0.0/0 → NAT Gateway route to the private route table
+  # This allows Session Manager and software installs on private EC2s
+  PrivateNATRoute:
+    Type: AWS::EC2::Route
+    DependsOn: NATGateway
+    Properties:
+      RouteTableId: !ImportValue PetHQ-PrivateRouteTableId
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  # ----------------------------------------------------------
+  # PHASE 9 — TARGET GROUP + ALB (Every Session)
+  # ----------------------------------------------------------
+
+  # Target Group — registers both app EC2s, health check on /health
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: pethq-private-app-targets
+      Protocol: HTTP
+      Port: 3000
+      VpcId: !ImportValue PetHQ-VPCId
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: "3000"
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      Targets:
+        - Id: !Ref AppEC2Id
+          Port: 3000
+        - Id: !Ref AppEC22Id
+          Port: 3000
+      Tags:
+        - Key: Name
+          Value: pethq-private-app-targets
+
+  # Application Load Balancer — internet-facing, listens on port 80
+  AppALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: pethq-alb
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets:
+        - !ImportValue PetHQ-PublicSubnetAZ1
+        - !ImportValue PetHQ-PublicSubnetAZ2
+      SecurityGroups:
+        - !ImportValue PetHQ-SGAlb
+      Tags:
+        - Key: Name
+          Value: pethq-alb
+
+  # ALB Listener — HTTP:80 → forward to target group
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AppALB
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+Outputs:
+
+  NATGatewayId:
+    Description: NAT Gateway ID — record in your resource sheet
+    Value: !Ref NATGateway
+
+  ElasticIPAddress:
+    Description: Elastic IP allocated to the NAT Gateway — release this at session end
+    Value: !Ref NATElasticIP
+
+  ALBDNSName:
+    Description: >
+      ALB DNS Name — use as [ALB-DNS] throughout the session.
+      Access Dify at: http://<this-value>/signin
+      Access PetHQ app at: http://<this-value>/
+    Value: !GetAtt AppALB.DNSName
+
+  ALBArn:
+    Description: ALB ARN
+    Value: !Ref AppALB
+
+  TargetGroupArn:
+    Description: Target Group ARN
+    Value: !Ref AppTargetGroup
+
+  SessionStartReminder:
+    Description: After deploying this stack — complete these steps before testing
+    Value: >
+      1) Wait 2-3 min for NAT route to propagate before using Session Manager.
+      2) On pethq-ollama: add swap (4 commands), then start Ollama and Dify.
+      3) On both app EC2s: mkdir /tmp/pethq-app, pull files from S3, npm install pg, start Node.
+      4) Targets will show Unhealthy until Node.js is running — this is expected.
+      See Session Start Checklist in the setup manual for full details.
+
+  SessionEndReminder:
+    Description: At session end — delete THIS stack to stop billing for NAT + ALB + EIP
+    Value: >
+      CloudFormation Console → select pethq-per-session stack → Delete.
+      Also stop RDS and EC2 instances manually (they are in the permanent stack).
+      Cost saved: ~$0.0725/hr by deleting this stack.
